@@ -1,21 +1,21 @@
 // POST /api/pair { number } — request an 8-digit WhatsApp pairing code for
-// the OWNER's own number, then wait (streaming) for the owner to enter it.
+// the OWNER's own number and return it immediately.
 //
-// Why streaming: the code must be shown to the owner within seconds, but the
-// socket has to stay alive while they type it into WhatsApp. So the handler
-// writes the code as the FIRST JSON line immediately, keeps the socket open
-// for ~42s, then writes a second JSON line with the result and ends.
-// A plain client sees two JSON lines; the web UI reads them as they arrive.
-//
-// Response lines:
-//   {"ok":true,"code":"ABCD-1234"}            — enter this in WhatsApp now
-//   {"ok":true,"paired":true}                 — done, session saved in KV
-//   {"ok":true,"paired":false,"error":"..."}  — code expired, request a new one
+// The code must reach the owner within seconds, but the socket has to stay
+// alive ~42s while they type it into WhatsApp. The old design held the HTTP
+// stream open for that wait — but on a phone the browser tab is backgrounded
+// the moment the owner switches to WhatsApp, the stream breaks, Vercel kills
+// the function, and the socket (and the code) dies with it. That is exactly
+// the "Server error" the first live attempts showed. So this handler replies
+// with {"ok":true,"code":"ABCD-1234"} at once, and keeps the socket waiting
+// in the background with waitUntil. The web UI polls /api/status for the
+// result; a later GET /api/status with registered:true means it worked.
 
 import { kvConfigFromEnv, createKvClient } from '../lib/kv.js';
 import { clearAuth } from '../lib/auth.js';
 import { openSession, defaultLogger, defaultGetVersion } from '../lib/whatsapp.js';
 import { normalizeNumber, maskNumber, readJsonBody, clientIp, rateLimited, sleep, sendJson } from '../lib/util.js';
+import { waitUntil as vercelWaitUntil } from '@vercel/functions';
 
 const pairHits = new Map();
 
@@ -25,6 +25,7 @@ export function createPairHandler(deps = {}) {
   const logger = deps.logger || defaultLogger();
   const settleMs = deps.settleMs ?? 1500;       // socket settle before requesting the code
   const waitMs = deps.waitMs ?? 42000;          // how long to wait for the owner to enter the code
+  const waitUntilFn = deps.waitUntil || vercelWaitUntil;
 
   return async (req, res) => {
     if (req.method !== 'POST') {
@@ -93,38 +94,27 @@ export function createPairHandler(deps = {}) {
     }
     console.log('pair code issued for', maskNumber(digits));
 
-    // Stream the code now; the owner has ~42s to enter it in WhatsApp.
-    res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
-    res.write(JSON.stringify({ ok: true, code }) + '\n');
-
-    let paired = false;
-    let waitError = null;
-    try {
-      const result = await session.waitForOpen(waitMs);
-      paired = result === 'open' || result === 'restarted';
-    } catch (e) {
-      waitError = e.message;
-    }
-    await session.persist().catch(() => {});
-    session.disconnect();
-
-    if (paired) {
-      console.log('pair completed for', maskNumber(digits));
-      res.write(JSON.stringify({ ok: true, paired: true }) + '\n');
-    } else {
-      if (waitError === 'loggedOut') {
-        // Dead session: remove it so the next attempt starts fresh.
-        await clearAuth(kv).catch(() => {});
+    // Reply NOW; keep the socket waiting in the background with waitUntil
+    // (see the header comment for why the stream must not be held open).
+    const settlePair = (async () => {
+      try {
+        const result = await session.waitForOpen(waitMs);
+        if (result === 'open' || result === 'restarted') {
+          await session.persist().catch(() => {});
+          console.log('pair completed for', maskNumber(digits));
+        }
+      } catch (e) {
+        if (e.message === 'loggedOut') {
+          // Dead session: remove it so the next attempt starts fresh.
+          await clearAuth(kv).catch(() => {});
+        }
+      } finally {
+        session.disconnect();
       }
-      res.write(JSON.stringify({
-        ok: true,
-        paired: false,
-        error: waitError === 'loggedOut'
-          ? 'WhatsApp logged the session out. Request a new code.'
-          : 'Pairing timed out. The code has expired — request a new one and enter it in WhatsApp within about 45 seconds.',
-      }) + '\n');
-    }
-    res.end();
+    })();
+    try { waitUntilFn(settlePair); } catch { /* not on Vercel: promise still runs */ }
+
+    sendJson(res, 200, { ok: true, code });
   };
 }
 

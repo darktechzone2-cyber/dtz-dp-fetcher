@@ -129,8 +129,10 @@ async function refreshStatus() {
 refreshStatus();
 setInterval(refreshStatus, 8000);
 
-// Pair: the server streams the code as the first JSON line, then a final
-// {"paired":...} line. Read line by line so the code shows immediately.
+// Pair: the server replies with the code immediately, then keeps the
+// WhatsApp socket waiting in the background (waitUntil) while the owner
+// types the code into WhatsApp. The page polls /api/status for the result
+// — no long stream is held, so switching to WhatsApp cannot kill it.
 $('pairBtn').addEventListener('click', async () => {
   const number = $('ownNumber').value.trim();
   if (!number) { setMsg(pairMsg, 'Enter your WhatsApp number first.', 'err'); return; }
@@ -139,45 +141,44 @@ $('pairBtn').addEventListener('click', async () => {
   setMsg(pairMsg, 'Connecting to WhatsApp…', 'info');
   try {
     const r = await fetch('/api/pair', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ number }) });
+    const d = await r.json().catch(() => ({}));
     if (!r.ok) {
-      const d = await r.json().catch(() => ({}));
       setMsg(pairMsg, (d && d.error) || 'Pairing failed. Try again.', 'err');
       btn.disabled = false; btn.textContent = 'Get pairing code';
       return;
     }
-    if (!r.body) { setMsg(pairMsg, 'Your browser does not support streaming. Try Chrome.', 'err'); return; }
-    const reader = r.body.getReader();
-    const decoder = new TextDecoder();
-    let buf = '';
-    let sawCode = false;
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
-      const lines = buf.split('\n');
-      buf = lines.pop();
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        let d; try { d = JSON.parse(line); } catch { continue; }
-        if (d.alreadyPaired) { setMsg(pairMsg, 'Already paired and connected.', 'ok'); refreshStatus(); }
-        else if (d.code) {
-          sawCode = true;
-          $('pairCode').textContent = d.code;
-          $('codeWrap').classList.remove('hidden');
-          setMsg(pairMsg, 'Code ready — enter it in WhatsApp NOW, you have about 45 seconds.', 'ok');
-        } else if (d.paired === true) {
+    if (d.alreadyPaired) {
+      setMsg(pairMsg, 'Already paired and connected.', 'ok');
+      refreshStatus();
+      btn.disabled = false; btn.textContent = 'Get pairing code';
+      return;
+    }
+    if (!d.code) {
+      setMsg(pairMsg, (d && d.error) || 'No code arrived. Try again.', 'err');
+      btn.disabled = false; btn.textContent = 'Get pairing code';
+      return;
+    }
+    $('pairCode').textContent = d.code;
+    $('codeWrap').classList.remove('hidden');
+    setMsg(pairMsg, 'Code ready — enter it in WhatsApp NOW, you have about 45 seconds.', 'ok');
+    // Poll the status until pairing completes or the code expires.
+    const started = Date.now();
+    const poll = setInterval(async () => {
+      try {
+        const s = await fetch('/api/status').then((x) => x.json());
+        if (s && s.registered) {
+          clearInterval(poll);
           setMsg(pairMsg, 'Paired successfully. You can fetch DPs now.', 'ok');
           refreshStatus();
-        } else if (d.paired === false) {
-          setMsg(pairMsg, d.error || 'Pairing timed out. Request a new code.', 'err');
-        } else if (d.error) {
-          setMsg(pairMsg, d.error, 'err');
+          btn.disabled = false; btn.textContent = 'Get pairing code';
+        } else if (Date.now() - started > 60000) {
+          clearInterval(poll);
+          setMsg(pairMsg, 'Pairing timed out. The code has expired — request a new one and enter it in WhatsApp within about 45 seconds.', 'err');
+          btn.disabled = false; btn.textContent = 'Get pairing code';
         }
-      }
-    }
-    if (!sawCode) setMsg(pairMsg, 'No code arrived. Try again.', 'err');
-  } catch { setMsg(pairMsg, 'Server error. Is the site up?', 'err'); }
-  btn.disabled = false; btn.textContent = 'Get pairing code';
+      } catch { /* keep polling until the timeout */ }
+    }, 3000);
+  } catch { setMsg(pairMsg, 'Server error. Is the site up?', 'err'); btn.disabled = false; btn.textContent = 'Get pairing code'; }
 });
 
 $('fetchBtn').addEventListener('click', async () => {

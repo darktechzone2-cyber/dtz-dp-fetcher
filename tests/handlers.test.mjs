@@ -114,9 +114,10 @@ async function waitFor(fn, timeoutMs = 5000, stepMs = 25) {
 const fastVersion = async () => ({ version: [2, 3000, 0] });
 
 // --- pair ------------------------------------------------------------------
-test('pair returns the code and persists registered creds when the owner enters it', async () => {
+test('pair returns the code immediately and completes pairing in the background', async () => {
   const kv = makeFakeKv();
   const sockets = [];
+  const bg = [];
   const handler = createPairHandler({
     kv,
     makeSocket: (opts) => { const s = new FakeSocket(opts); sockets.push(s); return s; },
@@ -124,23 +125,22 @@ test('pair returns the code and persists registered creds when the owner enters 
     logger: silentLogger,
     settleMs: 10,
     waitMs: 5000,
+    waitUntil: (p) => { bg.push(p); },
   });
-  const req = mockReq({ body: { number: '+92 300 1234567' } });
   const res = mockRes();
-  const run = handler(req, res);
-
-  // The code line must arrive first, before pairing completes.
-  const codeLine = await waitFor(() => res.chunks.find((c) => c.includes('1234-5678')));
-  assert.match(codeLine, /"code":"1234-5678"/);
-
-  // Owner enters the code in WhatsApp now.
-  await waitFor(() => sockets[0]);
-  sockets[0].emitOpen();
-  await run;
+  await handler(mockReq({ body: { number: '+92 300 1234567' } }), res);
   await res.endPromise;
 
-  const finalLine = res.chunks.find((c) => c.includes('paired'));
-  assert.match(finalLine, /"paired":true/);
+  // The code comes back in the immediate JSON reply — no stream is held.
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.jsonBody.code, '1234-5678');
+  assert.equal(bg.length, 1, 'background wait started');
+
+  // Owner enters the code in WhatsApp now (browser tab may be backgrounded).
+  await waitFor(() => sockets[0]);
+  sockets[0].emitOpen();
+  await bg[0];
+
   const savedCreds = JSON.parse(kv.store.get(CREDS_KEY), BufferJSON.reviver);
   assert.equal(savedCreds.registered, true);
   assert.ok(kv.store.has(KEYS_KEY), 'keys key written too');
@@ -160,6 +160,7 @@ test('pair wipes a stale unregistered session and pairs from fresh creds', async
   const seeded = seedUnregisteredKv(kv);
   const seededJson = kv.store.get(CREDS_KEY);
   const sockets = [];
+  const bg = [];
   const handler = createPairHandler({
     kv,
     makeSocket: (opts) => { const s = new FakeSocket(opts); sockets.push(s); return s; },
@@ -167,23 +168,22 @@ test('pair wipes a stale unregistered session and pairs from fresh creds', async
     logger: silentLogger,
     settleMs: 10,
     waitMs: 5000,
+    waitUntil: (p) => { bg.push(p); },
   });
-  const req = mockReq({ body: { number: '+92 300 1234567' } });
   const res = mockRes();
-  const run = handler(req, res);
+  await handler(mockReq({ body: { number: '+92 300 1234567' } }), res);
+  await res.endPromise;
 
-  const codeLine = await waitFor(() => res.chunks.find((c) => c.includes('1234-5678')));
-  assert.match(codeLine, /"code":"1234-5678"/);
+  assert.equal(res.jsonBody.code, '1234-5678');
   // First socket opened the stale session and was discarded; the live
   // socket is the second one, with fresh creds.
   await waitFor(() => sockets[1]);
   assert.notEqual(sockets[1].capturedCreds, seeded);
   sockets[1].emitOpen();
-  await run;
-  await res.endPromise;
+  await bg[0];
 
-  const finalLine = res.chunks.find((c) => c.includes('paired'));
-  assert.match(finalLine, /"paired":true/);
+  const savedCreds = JSON.parse(kv.store.get(CREDS_KEY), BufferJSON.reviver);
+  assert.equal(savedCreds.registered, true);
   assert.notEqual(kv.store.get(CREDS_KEY), seededJson, 'stale creds replaced, not reused');
 });
 
@@ -191,6 +191,7 @@ test('pair wipes the dead session after WhatsApp logs it out', async () => {
   const kv = makeFakeKv();
   seedUnregisteredKv(kv);
   const sockets = [];
+  const bg = [];
   const handler = createPairHandler({
     kv,
     makeSocket: (opts) => { const s = new FakeSocket(opts); sockets.push(s); return s; },
@@ -198,19 +199,17 @@ test('pair wipes the dead session after WhatsApp logs it out', async () => {
     logger: silentLogger,
     settleMs: 10,
     waitMs: 5000,
+    waitUntil: (p) => { bg.push(p); },
   });
   const res = mockRes();
-  const run = handler(mockReq({ body: { number: '+92 300 1234567' } }), res);
-
-  await waitFor(() => res.chunks.find((c) => c.includes('1234-5678')));
-  await waitFor(() => sockets[1]);
-  sockets[1].emitClose(401); // WhatsApp: logged out
-  await run;
+  await handler(mockReq({ body: { number: '+92 300 1234567' } }), res);
   await res.endPromise;
 
-  const finalLine = res.chunks.find((c) => c.includes('paired'));
-  assert.match(finalLine, /"paired":false/);
-  assert.match(finalLine, /logged the session out/);
+  assert.equal(res.jsonBody.code, '1234-5678');
+  await waitFor(() => sockets[1]);
+  sockets[1].emitClose(401); // WhatsApp: logged out
+  await bg[0];
+
   assert.equal(kv.store.has(CREDS_KEY), false, 'dead creds wiped');
   assert.equal(kv.store.has(KEYS_KEY), false, 'dead keys wiped');
 });
