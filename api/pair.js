@@ -13,6 +13,7 @@
 //   {"ok":true,"paired":false,"error":"..."}  — code expired, request a new one
 
 import { kvConfigFromEnv, createKvClient } from '../lib/kv.js';
+import { clearAuth } from '../lib/auth.js';
 import { openSession, defaultLogger, defaultGetVersion } from '../lib/whatsapp.js';
 import { normalizeNumber, maskNumber, readJsonBody, clientIp, rateLimited, sleep, sendJson } from '../lib/util.js';
 
@@ -63,6 +64,21 @@ export function createPairHandler(deps = {}) {
       return;
     }
 
+    // A failed attempt leaves unregistered creds behind; WhatsApp kills a
+    // re-used dead session with 401 loggedOut, and the handler then saves
+    // those dead creds back — so every retry fails the same way. Start
+    // every pairing from blank creds when a stale session is stored.
+    if (session.hadStored) {
+      session.disconnect();
+      await clearAuth(kv).catch(() => {});
+      try {
+        session = await openSession({ kv, makeSocket, getVersion, logger });
+      } catch {
+        sendJson(res, 502, { ok: false, error: 'Could not start a WhatsApp connection. Try again.' });
+        return;
+      }
+    }
+
     // Same settle delay as the proven Node pair site before asking for a code.
     await sleep(settleMs);
 
@@ -96,6 +112,10 @@ export function createPairHandler(deps = {}) {
       console.log('pair completed for', maskNumber(digits));
       res.write(JSON.stringify({ ok: true, paired: true }) + '\n');
     } else {
+      if (waitError === 'loggedOut') {
+        // Dead session: remove it so the next attempt starts fresh.
+        await clearAuth(kv).catch(() => {});
+      }
       res.write(JSON.stringify({
         ok: true,
         paired: false,

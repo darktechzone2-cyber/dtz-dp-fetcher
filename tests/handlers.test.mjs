@@ -23,7 +23,15 @@ function makeFakeKv() {
     store,
     async get(key) { return store.has(key) ? store.get(key) : null; },
     async set(key, value) { store.set(key, value); return true; },
+    async del(key) { store.delete(key); return true; },
   };
+}
+
+function seedUnregisteredKv(kv) {
+  const creds = initAuthCreds(); // registered === false
+  kv.store.set(CREDS_KEY, JSON.stringify(creds, BufferJSON.replacer));
+  kv.store.set(KEYS_KEY, JSON.stringify({}, BufferJSON.replacer));
+  return creds;
 }
 
 function seedRegisteredKv(kv) {
@@ -145,6 +153,66 @@ test('pair rejects a bad number and returns a clear error', async () => {
   await handler(mockReq({ body: { number: '12' } }), res);
   assert.equal(res.statusCode, 400);
   assert.match(res.jsonBody.error, /valid WhatsApp number/);
+});
+
+test('pair wipes a stale unregistered session and pairs from fresh creds', async () => {
+  const kv = makeFakeKv();
+  const seeded = seedUnregisteredKv(kv);
+  const seededJson = kv.store.get(CREDS_KEY);
+  const sockets = [];
+  const handler = createPairHandler({
+    kv,
+    makeSocket: (opts) => { const s = new FakeSocket(opts); sockets.push(s); return s; },
+    getVersion: fastVersion,
+    logger: silentLogger,
+    settleMs: 10,
+    waitMs: 5000,
+  });
+  const req = mockReq({ body: { number: '+92 300 1234567' } });
+  const res = mockRes();
+  const run = handler(req, res);
+
+  const codeLine = await waitFor(() => res.chunks.find((c) => c.includes('1234-5678')));
+  assert.match(codeLine, /"code":"1234-5678"/);
+  // First socket opened the stale session and was discarded; the live
+  // socket is the second one, with fresh creds.
+  await waitFor(() => sockets[1]);
+  assert.notEqual(sockets[1].capturedCreds, seeded);
+  sockets[1].emitOpen();
+  await run;
+  await res.endPromise;
+
+  const finalLine = res.chunks.find((c) => c.includes('paired'));
+  assert.match(finalLine, /"paired":true/);
+  assert.notEqual(kv.store.get(CREDS_KEY), seededJson, 'stale creds replaced, not reused');
+});
+
+test('pair wipes the dead session after WhatsApp logs it out', async () => {
+  const kv = makeFakeKv();
+  seedUnregisteredKv(kv);
+  const sockets = [];
+  const handler = createPairHandler({
+    kv,
+    makeSocket: (opts) => { const s = new FakeSocket(opts); sockets.push(s); return s; },
+    getVersion: fastVersion,
+    logger: silentLogger,
+    settleMs: 10,
+    waitMs: 5000,
+  });
+  const res = mockRes();
+  const run = handler(mockReq({ body: { number: '+92 300 1234567' } }), res);
+
+  await waitFor(() => res.chunks.find((c) => c.includes('1234-5678')));
+  await waitFor(() => sockets[1]);
+  sockets[1].emitClose(401); // WhatsApp: logged out
+  await run;
+  await res.endPromise;
+
+  const finalLine = res.chunks.find((c) => c.includes('paired'));
+  assert.match(finalLine, /"paired":false/);
+  assert.match(finalLine, /logged the session out/);
+  assert.equal(kv.store.has(CREDS_KEY), false, 'dead creds wiped');
+  assert.equal(kv.store.has(KEYS_KEY), false, 'dead keys wiped');
 });
 
 test('pair reports alreadyPaired when KV already holds a registered session', async () => {
