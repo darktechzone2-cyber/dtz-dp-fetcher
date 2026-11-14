@@ -9,7 +9,7 @@ import { BufferJSON, initAuthCreds } from '@whiskeysockets/baileys';
 import { createPairHandler } from '../api/pair.js';
 import { createFetchHandler } from '../api/fetch.js';
 import { createStatusHandler } from '../api/status.js';
-import { CREDS_KEY, KEYS_KEY } from '../lib/kv.js';
+import { CREDS_KEY, KEYS_KEY, PAIR_CODE_KEY } from '../lib/kv.js';
 
 const silentLogger = {
   level: 'silent',
@@ -54,6 +54,9 @@ class FakeSocket {
     this.ended = false;
   }
   emit(ev, data) { for (const fn of this.handlers[ev] || []) fn(data); }
+  emitConnecting() {
+    this.emit('connection.update', { connection: 'connecting', qr: 'fake-qr-ref' });
+  }
   emitOpen() {
     if (this.capturedCreds) this.capturedCreds.registered = true;
     this.emit('creds.update', this.capturedCreds);
@@ -123,12 +126,16 @@ test('pair returns the code immediately and completes pairing in the background'
     makeSocket: (opts) => { const s = new FakeSocket(opts); sockets.push(s); return s; },
     getVersion: fastVersion,
     logger: silentLogger,
-    settleMs: 10,
+    connectTimeoutMs: 5000,
     waitMs: 5000,
     waitUntil: (p) => { bg.push(p); },
   });
   const res = mockRes();
-  await handler(mockReq({ body: { number: '+92 300 1234567' } }), res);
+  const run = handler(mockReq({ body: { number: '+92 300 1234567' } }), res);
+  // The server must answer the handshake (qr) before any code is issued.
+  await waitFor(() => sockets[0]);
+  sockets[0].emitConnecting();
+  await run;
   await res.endPromise;
 
   // The code comes back in the immediate JSON reply — no stream is held.
@@ -137,13 +144,55 @@ test('pair returns the code immediately and completes pairing in the background'
   assert.equal(bg.length, 1, 'background wait started');
 
   // Owner enters the code in WhatsApp now (browser tab may be backgrounded).
-  await waitFor(() => sockets[0]);
   sockets[0].emitOpen();
   await bg[0];
 
   const savedCreds = JSON.parse(kv.store.get(CREDS_KEY), BufferJSON.reviver);
   assert.equal(savedCreds.registered, true);
   assert.ok(kv.store.has(KEYS_KEY), 'keys key written too');
+});
+
+test('pair returns a clear 502 and no code when WhatsApp never answers the handshake', async () => {
+  const kv = makeFakeKv();
+  const sockets = [];
+  const bg = [];
+  const handler = createPairHandler({
+    kv,
+    makeSocket: (opts) => { const s = new FakeSocket(opts); sockets.push(s); return s; },
+    getVersion: fastVersion,
+    logger: silentLogger,
+    connectTimeoutMs: 100,
+    waitMs: 5000,
+    waitUntil: (p) => { bg.push(p); },
+  });
+  const res = mockRes();
+  await handler(mockReq({ body: { number: '+92 300 1234567' }, ip: '127.0.0.2' }), res);
+  await res.endPromise;
+
+  assert.equal(res.statusCode, 502);
+  assert.match(res.jsonBody.error, /Could not connect to WhatsApp/);
+  assert.equal(res.jsonBody.code, undefined);
+  assert.equal(bg.length, 0, 'no background wait without a real code');
+});
+
+test('pair returns the same live code for a repeat request instead of a second code', async () => {
+  const kv = makeFakeKv();
+  kv.store.set(PAIR_CODE_KEY, JSON.stringify({ code: 'AAAA-1111', number: '923001234567', at: Date.now() }));
+  const sockets = [];
+  const handler = createPairHandler({
+    kv,
+    makeSocket: (opts) => { const s = new FakeSocket(opts); sockets.push(s); return s; },
+    getVersion: fastVersion,
+    logger: silentLogger,
+  });
+  const res = mockRes();
+  await handler(mockReq({ body: { number: '+92 300 1234567' }, ip: '127.0.0.3' }), res);
+  await res.endPromise;
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.jsonBody.code, 'AAAA-1111');
+  assert.equal(res.jsonBody.reused, true);
+  assert.equal(sockets.length, 0, 'no socket opened for a live code');
 });
 
 test('pair rejects a bad number and returns a clear error', async () => {
@@ -166,18 +215,20 @@ test('pair wipes a stale unregistered session and pairs from fresh creds', async
     makeSocket: (opts) => { const s = new FakeSocket(opts); sockets.push(s); return s; },
     getVersion: fastVersion,
     logger: silentLogger,
-    settleMs: 10,
+    connectTimeoutMs: 5000,
     waitMs: 5000,
     waitUntil: (p) => { bg.push(p); },
   });
   const res = mockRes();
-  await handler(mockReq({ body: { number: '+92 300 1234567' } }), res);
+  const run = handler(mockReq({ body: { number: '+92 300 1234567' } }), res);
+  // First socket opened the stale session and was discarded; the live
+  // socket is the second one — it must answer the handshake first.
+  await waitFor(() => sockets[1]);
+  sockets[1].emitConnecting();
+  await run;
   await res.endPromise;
 
   assert.equal(res.jsonBody.code, '1234-5678');
-  // First socket opened the stale session and was discarded; the live
-  // socket is the second one, with fresh creds.
-  await waitFor(() => sockets[1]);
   assert.notEqual(sockets[1].capturedCreds, seeded);
   sockets[1].emitOpen();
   await bg[0];
@@ -197,16 +248,18 @@ test('pair wipes the dead session after WhatsApp logs it out', async () => {
     makeSocket: (opts) => { const s = new FakeSocket(opts); sockets.push(s); return s; },
     getVersion: fastVersion,
     logger: silentLogger,
-    settleMs: 10,
+    connectTimeoutMs: 5000,
     waitMs: 5000,
     waitUntil: (p) => { bg.push(p); },
   });
   const res = mockRes();
-  await handler(mockReq({ body: { number: '+92 300 1234567' } }), res);
+  const run = handler(mockReq({ body: { number: '+92 300 1234567' } }), res);
+  await waitFor(() => sockets[1]);
+  sockets[1].emitConnecting();
+  await run;
   await res.endPromise;
 
   assert.equal(res.jsonBody.code, '1234-5678');
-  await waitFor(() => sockets[1]);
   sockets[1].emitClose(401); // WhatsApp: logged out
   await bg[0];
 
